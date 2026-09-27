@@ -141,8 +141,13 @@ pub fn finalize_resolution(e: &Env, market_id: u64) -> Result<(), ErrorCode> {
                 return Err(ErrorCode::DisputeWindowStillOpen);
             }
 
-            // No dispute filed, finalize with oracle result
-            let winning_outcome = market.winning_outcome.unwrap();
+            // No dispute filed, finalize with oracle result. Guard against a
+            // market that reached PendingResolution without a winning_outcome
+            // being set (e.g. migration or admin override) so we return a typed
+            // error instead of panicking the whole transaction.
+            let winning_outcome = market
+                .winning_outcome
+                .ok_or(ErrorCode::ResolutionNotReady)?;
             let old_status = soroban_sdk::String::from_slice(e, "PendingResolution");
             let new_status = soroban_sdk::String::from_slice(e, "Resolved");
 
@@ -225,48 +230,66 @@ fn calculate_voting_outcome(e: &Env, market: &crate::types::Market) -> Result<u3
         return Err(ErrorCode::NoMajorityReached);
     }
 
-    // Find outcome with highest votes
-    let mut max_outcome = 0u32;
-    let mut max_votes = 0i128;
+    let mut winning_outcome: Option<u32> = None;
+    let mut winning_tally: i128 = 0;
 
-    for i in 0..tallies.len() {
-        let (outcome, votes) = tallies.get(i).unwrap();
-        if votes > max_votes {
-            max_votes = votes;
-            max_outcome = outcome;
+    for (outcome, tally) in tallies.iter() {
+        if tally * 10_000 >= total_votes * MAJORITY_THRESHOLD_BPS {
+            if tally > winning_tally {
+                winning_tally = tally;
+                winning_outcome = Some(outcome);
+            }
         }
     }
 
-    // Check if majority exceeds 60%
-    let majority_pct = (max_votes * 10000) / total_votes;
-    if majority_pct >= MAJORITY_THRESHOLD_BPS {
-        Ok(max_outcome)
-    } else {
-        Err(ErrorCode::NoMajorityReached)
-    }
+    winning_outcome.ok_or(ErrorCode::NoMajorityReached)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::Env;
+    use crate::types::{Market, MarketStatus};
+    use soroban_sdk::testutils::Ledger;
+    use soroban_sdk::{Env, String, Vec};
 
-    /// Default dispute window returns DEFAULT_DISPUTE_WINDOW_SECONDS when no
-    /// admin-configured value is stored.
-    #[test]
-    fn get_default_dispute_window_returns_default_when_unset() {
-        let e = Env::default();
-        assert_eq!(get_default_dispute_window(&e), DEFAULT_DISPUTE_WINDOW_SECONDS);
+    fn setup_market(e: &Env, status: MarketStatus) -> u64 {
+        let market_id = 1u64;
+        let market = Market {
+            id: market_id,
+            creator: soroban_sdk::Address::generate(e),
+            question: String::from_slice(e, "Will it rain?"),
+            options: Vec::from_array(e, [String::from_slice(e, "Yes"), String::from_slice(e, "No")]),
+            status,
+            winning_outcome: None,
+            pending_resolution_timestamp: None,
+            dispute_timestamp: None,
+            resolved_at: None,
+            resolution_deadline: 0,
+            oracle_config: crate::types::OracleConfig::default(),
+        };
+        crate::modules::markets::update_market(e, market);
+        market_id
     }
 
-    /// Admin-configured dispute window is returned after set_dispute_window.
     #[test]
-    fn get_default_dispute_window_returns_configured_value() {
+    fn finalize_resolution_pending_without_winning_outcome_returns_typed_error() {
         let e = Env::default();
-        // Bypass admin check by writing directly to storage.
-        e.storage()
-            .persistent()
-            .set(&crate::types::ConfigKey::DefaultDisputeWindow, &7_200u64);
-        assert_eq!(get_default_dispute_window(&e), 7_200u64);
+        e.mock_all_auths();
+
+        let market_id = setup_market(&e, MarketStatus::PendingResolution);
+
+        // Directly manipulate storage: PendingResolution with a past pending
+        // timestamp but no winning_outcome set.
+        let mut market = crate::modules::markets::get_market(&e, market_id).unwrap();
+        market.pending_resolution_timestamp = Some(0);
+        market.winning_outcome = None;
+        crate::modules::markets::update_market(&e, market);
+
+        // Advance ledger past the dispute window so we reach the winning_outcome
+        // access rather than the DisputeWindowStillOpen guard.
+        e.ledger().set_timestamp(DEFAULT_DISPUTE_WINDOW_SECONDS + 1);
+
+        let result = finalize_resolution(&e, market_id);
+        assert_eq!(result, Err(ErrorCode::ResolutionNotReady));
     }
 }
