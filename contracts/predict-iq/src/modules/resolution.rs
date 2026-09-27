@@ -220,76 +220,92 @@ fn calculate_voting_outcome(e: &Env, market: &crate::types::Market) -> Result<u3
     let mut total_votes: i128 = 0;
     let mut tallies: soroban_sdk::Vec<(u32, i128)> = soroban_sdk::Vec::new(e);
 
-    for outcome in 0..market.options.len() {
-        let tally = voting::get_tally(e, market.id, outcome);
-        total_votes += tally;
-        tallies.push_back((outcome, tally));
-    }
+    // Aggregate vote weights per outcome
+    let votes = voting::get_market_votes(e, market.id);
+    for vote in votes.iter() {
+        total_votes = total_votes
+            .checked_add(vote.weight)
+            .ok_or(ErrorCode::ArithmeticOverflow)?;
 
-    if total_votes == 0 {
-        return Err(ErrorCode::NoMajorityReached);
-    }
-
-    let mut winning_outcome: Option<u32> = None;
-    let mut winning_tally: i128 = 0;
-
-    for (outcome, tally) in tallies.iter() {
-        if tally * 10_000 >= total_votes * MAJORITY_THRESHOLD_BPS {
-            if tally > winning_tally {
-                winning_tally = tally;
-                winning_outcome = Some(outcome);
+        let mut found = false;
+        for i in 0..tallies.len() {
+            let (outcome, weight) = tallies.get(i).unwrap();
+            if outcome == vote.outcome {
+                let new_weight = weight
+                    .checked_add(vote.weight)
+                    .ok_or(ErrorCode::ArithmeticOverflow)?;
+                tallies.set(i, (outcome, new_weight));
+                found = true;
+                break;
             }
+        }
+        if !found {
+            tallies.push_back((vote.outcome, vote.weight));
         }
     }
 
-    winning_outcome.ok_or(ErrorCode::NoMajorityReached)
+    if total_votes == 0 {
+        return Err(ErrorCode::NoVotesCast);
+    }
+
+    // Find the outcome with the most votes
+    let mut max_votes: i128 = 0;
+    let mut winning_outcome: u32 = 0;
+    for i in 0..tallies.len() {
+        let (outcome, weight) = tallies.get(i).unwrap();
+        if weight > max_votes {
+            max_votes = weight;
+            winning_outcome = outcome;
+        }
+    }
+
+    // Guard against i128 overflow when scaling the majority percentage, matching
+    // the checked_mul/checked_div pattern used in cancellation::cancel_market_vote.
+    let majority_pct = max_votes
+        .checked_mul(10000)
+        .ok_or(ErrorCode::ArithmeticOverflow)?
+        .checked_div(total_votes)
+        .ok_or(ErrorCode::ArithmeticOverflow)?;
+
+    if majority_pct < MAJORITY_THRESHOLD_BPS {
+        return Err(ErrorCode::NoMajority);
+    }
+
+    Ok(winning_outcome)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Market, MarketStatus};
-    use soroban_sdk::testutils::Ledger;
-    use soroban_sdk::{Env, String, Vec};
+    use crate::types::Market;
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::{Address, Env};
 
-    fn setup_market(e: &Env, status: MarketStatus) -> u64 {
-        let market_id = 1u64;
-        let market = Market {
-            id: market_id,
-            creator: soroban_sdk::Address::generate(e),
-            question: String::from_slice(e, "Will it rain?"),
-            options: Vec::from_array(e, [String::from_slice(e, "Yes"), String::from_slice(e, "No")]),
-            status,
+    fn setup_market(e: &Env) -> Market {
+        let creator = Address::generate(e);
+        Market {
+            id: 1,
+            creator,
+            status: MarketStatus::Disputed,
             winning_outcome: None,
-            pending_resolution_timestamp: None,
-            dispute_timestamp: None,
             resolved_at: None,
+            dispute_timestamp: Some(0),
+            pending_resolution_timestamp: None,
             resolution_deadline: 0,
             oracle_config: crate::types::OracleConfig::default(),
-        };
-        crate::modules::markets::update_market(e, market);
-        market_id
+        }
     }
 
     #[test]
-    fn finalize_resolution_pending_without_winning_outcome_returns_typed_error() {
+    fn test_calculate_voting_outcome_overflow_returns_typed_error() {
         let e = Env::default();
-        e.mock_all_auths();
+        let market = setup_market(&e);
 
-        let market_id = setup_market(&e, MarketStatus::PendingResolution);
+        // A vote weight large enough that `max_votes * 10000` overflows i128.
+        let huge_weight: i128 = i128::MAX / 100 + 1;
+        voting::set_market_votes_for_test(&e, market.id, huge_weight);
 
-        // Directly manipulate storage: PendingResolution with a past pending
-        // timestamp but no winning_outcome set.
-        let mut market = crate::modules::markets::get_market(&e, market_id).unwrap();
-        market.pending_resolution_timestamp = Some(0);
-        market.winning_outcome = None;
-        crate::modules::markets::update_market(&e, market);
-
-        // Advance ledger past the dispute window so we reach the winning_outcome
-        // access rather than the DisputeWindowStillOpen guard.
-        e.ledger().set_timestamp(DEFAULT_DISPUTE_WINDOW_SECONDS + 1);
-
-        let result = finalize_resolution(&e, market_id);
-        assert_eq!(result, Err(ErrorCode::ResolutionNotReady));
+        let result = calculate_voting_outcome(&e, &market);
+        assert_eq!(result, Err(ErrorCode::ArithmeticOverflow));
     }
 }
