@@ -235,6 +235,21 @@ pub fn emit_creation_deposit_set(e: &Env, old_amount: i128, new_amount: i128) {
     );
 }
 
+/// Issue #1544: Emit CircuitBreakerThresholdSet event.
+///
+/// Follows the `emit_creation_deposit_set` pattern so indexers can track
+/// configuration drift of the loss threshold that gates the circuit breaker.
+///
+/// Indexer schema:
+///   topics: [cb_thr_set]
+///   data:   (version: u32, old_threshold: i128, new_threshold: i128)
+pub fn emit_circuit_breaker_threshold_set(e: &Env, old_threshold: i128, new_threshold: i128) {
+    e.events().publish(
+        (symbol_short!("cb_thr_set"),),
+        (EVENT_VERSION, old_threshold, new_threshold),
+    );
+}
+
 pub fn emit_monitoring_state_reset(
     e: &Env,
     resetter: Address,
@@ -266,35 +281,6 @@ pub fn emit_upgrade_initiated(e: &Env, initiator: Address, wasm_hash: soroban_sd
 }
 
 pub fn emit_upgrade_voted(e: &Env, voter: Address, vote_for: bool) {
-    e.events().publish(
-        (symbol_short!("upg_vote"), voter),
-        (EVENT_VERSION, vote_for),
-    );
-}
+    e.
 
-pub fn emit_upgrade_executed(e: &Env, executor: Address, wasm_hash: soroban_sdk::BytesN<32>) {
-    e.events().publish(
-        (symbol_short!("upg_exec"), executor),
-        (EVENT_VERSION, wasm_hash),
-    );
-}
-
-pub fn emit_upgrade_rejected(e: &Env, wasm_hash: soroban_sdk::BytesN<32>) {
-    e.events()
-        .publish((symbol_short!("upg_rej"),), (EVENT_VERSION, wasm_hash));
-}
-
-/// Issue #506: Emit MarketStateChanged event for indexing
-/// Includes all fields needed for off-chain state reconstruction
-pub fn emit_market_state_changed(
-    e: &Env,
-    market_id: u64,
-    old_status: soroban_sdk::String,
-    new_status: soroban_sdk::String,
-    timestamp: u64,
-) {
-    e.events().publish(
-        (symbol_short!("mkt_state"), market_id),
-        (EVENT_VERSION, old_status, new_status, timestamp),
-    );
-}
+/* … truncated 920 chars — edit only what you need near the top … */
